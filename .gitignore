@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# 数据
+data/chroma_db/
+data/uploads/
+data/bm25_index.pkl
+
+# 密钥
+.streamlit/secrets.toml
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

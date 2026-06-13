@@ -1,0 +1,28 @@
+# RAG 知识问答系统依赖
+# Python 3.10+
+
+# --- 文档解析 ---
+PyMuPDF>=1.24.0          # PDF 解析（fitz）
+python-docx>=1.1.0       # Word 文档解析
+
+# --- 向量数据库 ---
+chromadb>=0.5.0          # 向量存储与检索
+
+# --- LLM ---
+openai>=1.30.0           # OpenAI 兼容接口 (DeepSeek / 硅基流动)
+
+# --- 混合检索 ---
+rank-bm25>=0.2.2         # BM25 关键词检索
+jieba>=0.42.1            # 中文分词
+
+# --- 可选: 本地 Embedding ---
+# sentence-transformers>=2.7.0  # 本地 BGE 模型 (离线免费备选)
+
+# --- 可选: 其他 LLM ---
+# anthropic>=0.39.0      # Claude API 备选
+
+# --- Web UI ---
+streamlit>=1.37.0        # Web 界面
+
+# --- 工具 ---
+python-dotenv>=1.0.0     # 环境变量管理
