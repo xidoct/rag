@@ -27,10 +27,12 @@
 - **备选**: Voyage AI / 硅基流动
 
 ## 文档处理
-- PDF: PyMuPDF，按页提取+表格识别
+- PDF: PyMuPDF 提取电子文本 + 表格识别
+  → 无文字时自动 OCR (pytesseract, chi_sim+eng, 200dpi)
 - Word: python-docx，段落+表格提取
 - ZIP: 自动解压递归处理
 - 分块: 智能识别标题/章节边界，800字符/块，150字符重叠，表格独立分块
+- OCR 需安装 Tesseract 引擎: https://github.com/UB-Mannheim/tesseract/wiki
 
 ## 反幻觉机制
 - System Prompt 严格约束: 只使用文档明确内容，禁止推理联想

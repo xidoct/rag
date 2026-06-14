@@ -1,6 +1,11 @@
 """
 文档加载器 — 支持 ZIP / PDF / Word 解析
 
+PDF 处理:
+- 优先提取电子文本 (PyMuPDF)
+- 无文字时自动 OCR 识别扫描件 (pytesseract + PyMuPDF 渲染)
+- 表格单独识别
+
 输入: 文件路径 (支持 .zip / .pdf / .docx)
 输出: 标准化 Document 对象列表
 """
@@ -13,6 +18,7 @@ from typing import Iterator
 
 import fitz  # PyMuPDF
 from docx import Document as DocxDocument
+from PIL import Image
 
 import config
 
@@ -47,14 +53,27 @@ def load_file(file_path: str | Path) -> list[Document]:
 
 
 def _load_pdf(path: Path) -> list[Document]:
-    """解析 PDF，按页提取文本"""
+    """
+    解析 PDF，按页提取文本
+    - 优先电子文本 (get_text)
+    - 无文字时自动 OCR (pytesseract)
+    - 表格单独识别
+    """
     docs = []
     doc = fitz.open(path)
     source = path.name
+    ocr_pages = 0
     try:
         for page_num in range(len(doc)):
             page = doc[page_num]
             text = page.get_text("text").strip()
+
+            # --- 电子文本为空 → OCR 扫描件 ---
+            if not text:
+                text = _ocr_page(page)
+                if text:
+                    ocr_pages += 1
+
             if not text:
                 continue
 
@@ -63,14 +82,13 @@ def _load_pdf(path: Path) -> list[Document]:
             table_texts = _extract_table_texts(tables)
 
             if table_texts:
-                # 表格内容单独成块
                 for t_text in table_texts:
                     docs.append(Document(
                         content=t_text,
                         source=source,
                         page=page_num + 1,
                         is_table=True,
-                        metadata={"type": "table"}
+                        metadata={"type": "table", "ocr": bool(not page.get_text("text").strip())}
                     ))
 
             if text:
@@ -78,11 +96,36 @@ def _load_pdf(path: Path) -> list[Document]:
                     content=text,
                     source=source,
                     page=page_num + 1,
-                    metadata={"type": "text"}
+                    metadata={"type": "text", "ocr": ocr_pages > 0}
                 ))
+
+        if ocr_pages > 0:
+            print(f"[PDF] {source}: {ocr_pages}/{len(doc)} 页使用 OCR 识别")
     finally:
         doc.close()
     return docs
+
+
+def _ocr_page(page: fitz.Page) -> str:
+    """
+    将 PDF 页渲染为图像，用 pytesseract 识别文字
+    中文 + 英文混合识别
+    """
+    try:
+        import pytesseract
+    except ImportError:
+        return ""   # 未安装 tesseract，跳过
+
+    try:
+        # PyMuPDF 渲染为 PIL Image
+        pix = page.get_pixmap(dpi=config.OCR_DPI)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        lang = config.OCR_LANG
+        text = pytesseract.image_to_string(img, lang=lang)
+        return text.strip()
+    except Exception:
+        return ""
 
 
 def _load_docx(path: Path) -> list[Document]:
