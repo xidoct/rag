@@ -55,8 +55,8 @@ def load_file(file_path: str | Path) -> list[Document]:
 def _load_pdf(path: Path) -> list[Document]:
     """
     解析 PDF，按页提取文本
-    - 优先电子文本 (get_text)
-    - 无文字时自动 OCR (PaddleOCR)
+    - 提取字体/字号/位置信息用于标题识别 (get_text("dict"))
+    - 优先电子文本，无文字时自动 OCR (PaddleOCR)
     - 表格单独识别
     """
     docs = []
@@ -69,13 +69,18 @@ def _load_pdf(path: Path) -> list[Document]:
             text = page.get_text("text").strip()
 
             # --- 电子文本为空 → OCR 扫描件 ---
+            is_ocr = False
             if not text:
                 text = _ocr_page(page)
                 if text:
+                    is_ocr = True
                     ocr_pages += 1
 
             if not text:
                 continue
+
+            # --- 提取字体信息用于标题识别 ---
+            font_info = _extract_font_info(page) if not is_ocr else []
 
             # 尝试提取表格
             tables = page.find_tables()
@@ -88,7 +93,7 @@ def _load_pdf(path: Path) -> list[Document]:
                         source=source,
                         page=page_num + 1,
                         is_table=True,
-                        metadata={"type": "table", "ocr": bool(not page.get_text("text").strip())}
+                        metadata={"type": "table", "ocr": is_ocr}
                     ))
 
             if text:
@@ -96,7 +101,7 @@ def _load_pdf(path: Path) -> list[Document]:
                     content=text,
                     source=source,
                     page=page_num + 1,
-                    metadata={"type": "text", "ocr": ocr_pages > 0}
+                    metadata={"type": "text", "ocr": is_ocr, "font_info": font_info}
                 ))
 
         if ocr_pages > 0:
@@ -104,6 +109,42 @@ def _load_pdf(path: Path) -> list[Document]:
     finally:
         doc.close()
     return docs
+
+
+def _extract_font_info(page: fitz.Page) -> list[dict]:
+    """
+    从 PDF 页面提取每行文字的字体信息
+    用于后续智能识别标题层级
+
+    Returns: [{"text": "第一章", "size": 16.0, "bold": True, "y": 100.5}, ...]
+    """
+    blocks = page.get_text("dict")["blocks"]
+    lines_info = []
+
+    for block in blocks:
+        if block.get("type") != 0:  # 非文本块跳过
+            continue
+        for line in block.get("lines", []):
+            spans = line["spans"]
+            if not spans:
+                continue
+
+            # 合并同一行的所有 span
+            line_text = "".join(s["text"] for s in spans)
+            # 取最大字号和是否粗体
+            max_size = max(s["size"] for s in spans)
+            is_bold = any(s.get("flags", 0) & 2 for s in spans)  # flags bit 1 = bold
+            y_pos = line["bbox"][1]  # 顶部 y 坐标
+
+            if line_text.strip():
+                lines_info.append({
+                    "text": line_text.strip(),
+                    "size": round(max_size, 1),
+                    "bold": is_bold,
+                    "y": round(y_pos, 1),
+                })
+
+    return lines_info
 
 
 def _ocr_page(page: fitz.Page) -> str:

@@ -1,76 +1,64 @@
 """
 智能分块器 — 按标题/章节/表格边界分块
 
-策略:
-1. 识别标题模式（中文数字、阿拉伯数字、关键词开头）
-2. 表格内容独立成块
-3. 普通文本按 CHUNK_SIZE 切分，保留重叠
-4. 每块携带元数据（来源、章节、页码）
+标题识别策略:
+1. 字体/字号/位置 (PyMuPDF get_text("dict")) — 主要手段
+   - 字号 > 正文字号 × 1.2 → 标题
+   - 粗体 + 字号偏大 → 各级标题
+   - 位置居左 + 字号最大 → 一级章节
+2. 正则模式匹配 — 兜底 (OCR 页面无字体信息时)
+3. 表格内容独立成块
+4. 普通文本按 CHUNK_SIZE 切分，保留重叠
 """
 
 import re
-from dataclasses import dataclass
+from statistics import median
+from typing import Optional
 
 from engine.loader import Document
 import config
 
 
-# --- 标题识别模式 ---
+# --- 正则兜底 (OCR 页面无字体信息时用) ---
 HEADING_PATTERNS = [
-    # 第X章、第一章 → 一级标题
     re.compile(r"^第[一二三四五六七八九十\d]+章\s*"),
-    # 一、二、三、 → 一级标题
-    re.compile(r"^[一二三四五六七八九十]、\s*"),
-    # 1. 1.1 1.1.1 → 分级标题
-    re.compile(r"^\d+(\.\d+)*\.?\s+"),
-    # （一）（二） → 二级标题
-    re.compile(r"^（[一二三四五六七八九十\d]+）\s*"),
-    # 一、 二、 (顿号形式)
-    re.compile(r"^[一二三四五六七八九十]、"),
-    # 第一章 第一节
     re.compile(r"^第[一二三四五六七八九十\d]+节"),
+    re.compile(r"^[一二三四五六七八九十]、\s*"),
+    re.compile(r"^\d+(\.\d+)*\.?\s+"),
+    re.compile(r"^（[一二三四五六七八九十\d]+）\s*"),
+    re.compile(r"^[一二三四五六七八九十]、"),
 ]
 
 
-def is_heading(line: str) -> bool:
-    """判断一行文本是否为标题"""
-    line = line.strip()
-    if not line or len(line) > 60:
-        return False
-    for pattern in HEADING_PATTERNS:
-        if pattern.match(line):
-            return True
-    return False
-
-
 def split_documents(documents: list[Document]) -> list[Document]:
-    """
-    智能分块主入口
-    对每个 Document 按策略分块，返回新的 Document 列表
-    """
+    """智能分块主入口"""
     chunks = []
     for doc in documents:
         if doc.is_table:
-            # 表格独立成块
             chunks.extend(_split_table(doc))
         else:
             chunks.extend(_split_text(doc))
     return chunks
 
 
+# ---- 文本分块 ----
+
 def _split_text(doc: Document) -> list[Document]:
-    """按标题边界 + 长度限制分块普通文本"""
+    """按标题边界 + 长度限制分块，优先用字体信息判断标题"""
     lines = doc.content.split("\n")
-    chunks = []
-    current_chunk_lines: list[str] = []
+    font_map = _build_font_map(doc)
+    body_size = _get_body_size(font_map)
+
+    chunks: list[Document] = []
+    current_lines: list[str] = []
     current_heading = doc.heading
     current_size = 0
 
-    def flush_chunk():
-        nonlocal current_chunk_lines, current_size
-        if not current_chunk_lines:
+    def flush():
+        nonlocal current_lines, current_size
+        if not current_lines:
             return
-        text = "\n".join(current_chunk_lines).strip()
+        text = "\n".join(current_lines).strip()
         if text:
             chunks.append(Document(
                 content=text,
@@ -79,76 +67,132 @@ def _split_text(doc: Document) -> list[Document]:
                 heading=current_heading,
                 metadata={**doc.metadata, "chunk_type": "text"}
             ))
-        current_chunk_lines = []
+        current_lines = []
         current_size = 0
 
     for line in lines:
         stripped = line.strip()
         if not stripped:
-            current_chunk_lines.append("")
+            current_lines.append("")
             continue
 
-        # 遇到标题 → 新分块开始
-        if is_heading(stripped):
-            flush_chunk()
+        # 判断是否为标题
+        if _is_heading_smart(stripped, font_map, body_size):
+            flush()
             current_heading = stripped
-            current_chunk_lines = [stripped]
+            current_lines = [stripped]
             current_size = len(stripped)
             continue
 
-        # 块大小超过阈值 → 切割
-        if current_size + len(stripped) > config.CHUNK_SIZE and current_chunk_lines:
-            flush_chunk()
-            # 重叠：保留最后几句作为新块的上下文
-            overlap_lines = _get_overlap_lines(current_chunk_lines)
+        # 超阈值切割
+        if current_size + len(stripped) > config.CHUNK_SIZE and current_lines:
+            flush()
 
-        current_chunk_lines.append(stripped)
+        current_lines.append(stripped)
         current_size += len(stripped)
 
-    flush_chunk()
+    flush()
     return chunks
 
+
+# ---- 表格分块 ----
 
 def _split_table(doc: Document) -> list[Document]:
-    """表格内容按大小分块，保持行完整"""
     lines = doc.content.split("\n")
     chunks = []
-    current_lines: list[str] = []
-    current_size = 0
+    cur_lines, cur_size = [], 0
 
     for line in lines:
-        if current_size + len(line) > config.TABLE_CHUNK_SIZE and current_lines:
+        if cur_size + len(line) > config.TABLE_CHUNK_SIZE and cur_lines:
             chunks.append(Document(
-                content="\n".join(current_lines),
-                source=doc.source,
-                page=doc.page,
-                heading=doc.heading,
-                is_table=True,
+                content="\n".join(cur_lines),
+                source=doc.source, page=doc.page,
+                heading=doc.heading, is_table=True,
                 metadata={**doc.metadata, "chunk_type": "table"}
             ))
-            # 表头保留作为上下文
-            header_line = current_lines[0] if current_lines else line
-            current_lines = [header_line, line]
-            current_size = len(header_line) + len(line)
+            header = cur_lines[0] if cur_lines else line
+            cur_lines, cur_size = [header, line], len(header) + len(line)
         else:
-            current_lines.append(line)
-            current_size += len(line)
+            cur_lines.append(line)
+            cur_size += len(line)
 
-    if current_lines:
+    if cur_lines:
         chunks.append(Document(
-            content="\n".join(current_lines),
-            source=doc.source,
-            page=doc.page,
-            heading=doc.heading,
-            is_table=True,
+            content="\n".join(cur_lines),
+            source=doc.source, page=doc.page,
+            heading=doc.heading, is_table=True,
             metadata={**doc.metadata, "chunk_type": "table"}
         ))
-
     return chunks
+
+
+# ---- 智能标题识别 ----
+
+def _build_font_map(doc: Document) -> dict[str, dict]:
+    """
+    从 Document metadata 构建字体查找表
+    key = 文本行前 60 字符, value = {size, bold, y}
+    """
+    font_info = doc.metadata.get("font_info", [])
+    if not font_info:
+        return {}
+    return {entry["text"][:60]: entry for entry in font_info}
+
+
+def _get_body_size(font_map: dict[str, dict]) -> Optional[float]:
+    """计算正文字号 (所有文本行字号的中位数)"""
+    sizes = [v["size"] for v in font_map.values()]
+    if not sizes:
+        return None
+    return median(sizes)
+
+
+def _is_heading_smart(
+    line: str,
+    font_map: dict[str, dict],
+    body_size: Optional[float],
+) -> bool:
+    """
+    综合判断: 字体特征 > 正则模式
+
+    标题特征:
+    - 字号 >= 正文字号 × 1.2
+    - 粗体 + 字号 > 正文
+    - 短文本 (< 60 字符) + 有编号模式
+    """
+    line = line.strip()
+    if not line or len(line) > 60:
+        return False
+
+    info = font_map.get(line[:60])
+
+    # --- 有字体信息: 用视觉特征判断 ---
+    if info and body_size:
+        size = info["size"]
+        bold = info.get("bold", False)
+
+        # 字号明显大于正文
+        if size >= body_size * 1.2:
+            return True
+
+        # 粗体 + 比正文大
+        if bold and size > body_size:
+            return True
+
+        # 字号等于最大字号 → 可能是一级标题
+        all_sizes = [v["size"] for v in font_map.values()]
+        if all_sizes and size == max(all_sizes) and len(line) < 30:
+            return True
+
+    # --- 无字体信息 (OCR): 用正则兜底 ---
+    for pattern in HEADING_PATTERNS:
+        if pattern.match(line):
+            return True
+
+    return False
 
 
 def _get_overlap_lines(lines: list[str], overlap_size: int = None) -> list[str]:
-    """从行列表末尾取 N 个字符作为重叠"""
     if overlap_size is None:
         overlap_size = config.CHUNK_OVERLAP
     overlap = []
