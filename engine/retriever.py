@@ -127,9 +127,15 @@ class Retriever:
     def ask(self, question: str, top_k: int = None) -> str:
         """检索 + 生成完整回答（非流式）"""
         self._ensure_client()
+        cached = cache.get(question)
+        if cached:
+            return cached["answer"]
         hits = self.multi_search(question, top_k=top_k)
         system_prompt, user_prompt = self._build_messages(question, hits)
-        return self._do_ask(system_prompt, user_prompt)
+        answer = self._do_ask(system_prompt, user_prompt)
+        confidence = max((h.get("rerank_score", 0) or h.get("similarity", 0)) for h in hits) if hits else 0
+        cache.set(question, answer, hits, confidence=confidence)
+        return answer
 
     def ask_stream(self, question: str, top_k: int = None) -> Iterator[tuple[str, list[dict]]]:
         """检索 + 流式生成。命中缓存则直接返回。"""
@@ -152,8 +158,9 @@ class Retriever:
             full_answer += delta
             yield (delta, hits)
 
-        # 写入缓存
-        cache.set(question, full_answer, hits)
+        # 写入缓存 (传入最高 rerank 分作为置信度)
+        confidence = max((h.get("rerank_score", 0) or h.get("similarity", 0)) for h in hits) if hits else 0
+        cache.set(question, full_answer, hits, confidence=confidence)
 
     # ---- 内部: 查询扩展 ----
 
